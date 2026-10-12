@@ -1,7 +1,7 @@
 /**
- * venue/app.js — 場主 LIFF 頁面
- * 頁面：shifts 我的排班／checkin 現場簽到／report 收班回報／profile 我的資料
- * 網址：https://liff.line.me/{LIFF_ID}?page=checkin（可加 &shift=排班ID）
+ * venue/app.js — 場主 LIFF 頁面　v2（2026/10/11）
+ * 頁面：shifts 我的排班／checkin 今日球敘（點名・輪轉・比分・積分）／report 收班回報／profile 我的資料
+ * 網址：https://liff.line.me/{LIFF_ID}?page=checkin（可加 &shift=排班ID&tab=score）
  */
 (function () {
   'use strict';
@@ -9,9 +9,20 @@
   const { esc, toast, money } = LiffKit;
   const CFG = window.APP_CONFIG || {};
   const PAGES = ['shifts', 'checkin', 'report', 'profile'];
+  const TABS = [
+    ['roll', '點名'],
+    ['rotation', '輪轉'],
+    ['score', '比分'],
+    ['rank', '積分'],
+  ];
   const POLL_MS = 30000;
+  const FLUSH_MS = 15000;
+  const QUEUE_KEY = 'venue.pendingScores.v1';
 
-  const state = { me: null, page: 'shifts', shiftId: '', roster: null, pollTimer: null, busy: false };
+  const state = {
+    me: null, page: 'shifts', tab: 'roll', shiftId: '', roster: null, court: '',
+    pollTimer: null, flushTimer: null, busy: false, flushing: false,
+  };
   const app = document.getElementById('app');
   const modal = document.getElementById('modal');
   const tabs = document.getElementById('tabs');
@@ -26,9 +37,13 @@
       const p = LiffKit.params();
       state.page = PAGES.indexOf(p.get('page')) >= 0 ? p.get('page') : 'shifts';
       state.shiftId = p.get('shift') || '';
+      if (TABS.some((t) => t[0] === p.get('tab'))) state.tab = p.get('tab');
       state.me = await api('me');
       document.getElementById('who').textContent = state.me.profile ? state.me.profile.name : state.me.lineName;
+      window.addEventListener('online', flushScores);
+      state.flushTimer = setInterval(flushScores, FLUSH_MS);
       route();
+      flushScores();
     } catch (e) {
       showFatal(e);
     }
@@ -45,12 +60,12 @@
     const s = state.me.state;
     tabs.hidden = s !== 'active';
     if (s === 'unregistered') return renderProfile(true);
-    if (s === 'pending') return renderNotice('審核中', '資料已送出，總場主核准後就能使用排班與簽到。核准後重新開啟即可。');
+    if (s === 'pending') return renderNotice('審核中', '資料已送出，總場主核准後就能使用排班與點名。核准後重新開啟即可。');
     if (s === 'inactive') return renderNotice('帳號停用', '你的帳號目前停用，如有疑問請直接在聊天室留言給總場主。');
 
     tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.page === state.page));
     if (state.page === 'shifts') return renderShifts();
-    if (state.page === 'checkin') return renderCheckin();
+    if (state.page === 'checkin') return renderSession();
     if (state.page === 'report') return renderReport();
     return renderProfile(false);
   }
@@ -76,13 +91,26 @@
   }
 
   /** 執行寫入動作：防止連點，錯誤統一提示 */
+  /** v2.1：取得定位 { lat, lng, acc }；失敗回傳 { error } */
+  function getLocation() {
+    return new Promise((resolve) => {
+      if (!navigator.geolocation) return resolve({ error: 'UNSUPPORTED' });
+      navigator.geolocation.getCurrentPosition(
+        (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy }),
+        (e) => resolve({ error: e.code === 1 ? 'DENIED' : 'UNAVAILABLE' }),
+        { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 }
+      );
+    });
+  }
+
   async function act(fn, okMsg) {
     if (state.busy) return null;
     state.busy = true;
     document.body.classList.add('busy');
     try {
       const r = await fn();
-      if (okMsg) toast(okMsg, 'ok');
+      const msg = (r && r.message) || okMsg;
+      if (msg) toast(msg, 'ok');
       return r;
     } catch (e) {
       toast(e.message, 'error');
@@ -92,6 +120,17 @@
       state.busy = false;
       document.body.classList.remove('busy');
     }
+  }
+
+  /** 場次相關的寫入：成功時更新資料並重畫 */
+  async function rosterAct(action, data, okMsg) {
+    const res = await act(() => api(action, Object.assign({ shiftId: state.shiftId }, data)), okMsg);
+    if (res) {
+      state.roster = res;
+      closeModal();
+      drawSession();
+    }
+    return res;
   }
 
   /* ---------- 我的排班 ---------- */
@@ -118,7 +157,7 @@
         </div>
         ${s.editable && s.sessionStatus !== '取消' ? `
         <div class="actions">
-          <button class="btn" data-go="checkin" data-shift="${esc(s.shiftId)}">現場簽到</button>
+          <button class="btn" data-go="checkin" data-shift="${esc(s.shiftId)}">今日球敘</button>
           <button class="btn ghost" data-go="report" data-shift="${esc(s.shiftId)}">收班回報</button>
         </div>` : ''}
       </div>`).join('');
@@ -149,9 +188,9 @@
     return '';
   }
 
-  /* ---------- 現場簽到 ---------- */
+  /* ---------- 今日球敘 ---------- */
 
-  async function renderCheckin() {
+  async function renderSession() {
     let shiftId;
     try {
       shiftId = await pickShift('checkin');
@@ -162,47 +201,117 @@
       state.shiftId = '';
       return showFatal(e);
     }
-    drawRoster();
+    drawSession();
     startPoll();
   }
 
-  function drawRoster() {
+  function drawSession() {
     const r = state.roster;
+    if (!r || state.page !== 'checkin') return;
     const s = r.session;
     const sum = r.summary;
     const arrived = r.shift.arrive === '已到場' || r.shift.arrive === '遲到';
-    const can = s.editable;
+    const pendingN = Object.keys(loadQueue()).length;
+    if (!state.court || !r.courts.some((c) => c.id === state.court)) state.court = r.courts.length ? r.courts[0].id : '';
+
+    const body = {
+      roll: drawRoll,
+      rotation: drawRotation,
+      score: drawScores,
+      rank: drawRank,
+    }[state.tab]();
 
     app.innerHTML = `
       <div class="card head">
-        <div class="title">${esc(s.name)}</div>
-        <div class="muted">${esc(s.date)}　${esc(s.start)}–${esc(s.end)}　${esc(s.venue)}</div>
+        <div class="title">${esc(s.name)} <span class="tag ${s.type === '不限' ? '' : 'blue'}">${esc(s.type)}</span></div>
+        <div class="muted">${esc(s.date)}　${esc(s.start)}–${esc(s.end)}　${esc(s.venue)}　每場 ${s.points} 分${s.winBy2 ? '・需贏 2 分' : ''}</div>
         <div class="stats">
-          <div><b>${sum.present}</b><span>已簽到</span></div>
+          <div><b>${sum.present}</b><span>在場</span></div>
           <div><b>${sum.registered}</b><span>報名／上限 ${s.capacity || '—'}</span></div>
-          <div><b>${sum.walkinPending}</b><span>待確認</span></div>
+          <div><b>${sum.walkinPending + (s.started ? sum.waitlist : 0)}</b><span>待處理</span></div>
           <div><b>${money(sum.systemTotal)}</b><span>我收的款</span></div>
         </div>
         ${arrived
           ? `<div class="arrived">✓ ${esc(r.shift.arrive)}　${esc(r.shift.arriveTime)}</div>`
-          : can ? '<button class="btn block" id="btnArrive">我已到場</button>' : ''}
-        ${!can ? '<p class="muted">此場次目前不可修改（只能在球敘當天或隔天操作）。</p>' : ''}
+          : s.editable ? '<button class="btn block" id="btnArrive">我已到場</button><p class="muted" style="text-align:center;margin:6px 0 0">開始前 30 分鐘起、在場地附近才能簽到</p>' : ''}
+        ${!s.editable ? '<p class="muted">此場次目前不可修改（只能在球敘當天或隔天操作）。</p>' : ''}
+        ${pendingN ? `<div class="offline">⚠ ${pendingN} 筆比分待上傳，恢復連線後會自動送出</div>` : ''}
       </div>
-      <div class="listhead">
-        <span>名單（${r.people.length}）</span>
-        <button class="link" id="btnRefresh">重新整理</button>
+      <div class="seg" role="tablist">
+        ${TABS.map((t) => `<button data-tab="${t[0]}" class="${state.tab === t[0] ? 'on' : ''}">${t[1]}</button>`).join('')}
       </div>
-      ${r.people.length ? r.people.map((p) => personRow(p, can)).join('') : '<div class="card muted">目前沒有報名者</div>'}
-      ${sum.waitlist ? `<p class="muted center">另有候補 ${sum.waitlist} 人（由系統自動遞補）</p>` : ''}
+      ${body}
     `;
 
     const btnArrive = document.getElementById('btnArrive');
+    // v2.1：開始前 30 分鐘起、在據點附近才能簽到 → 先取得定位再送出
     if (btnArrive) btnArrive.addEventListener('click', async () => {
-      const res = await act(() => api('arrive', { shiftId: state.shiftId }), '已記錄到場');
-      if (res) { state.roster = res; drawRoster(); }
+      if (state.busy) return;
+      btnArrive.disabled = true;
+      btnArrive.textContent = '確認位置中…';
+      const loc = await getLocation();
+      btnArrive.disabled = false;
+      btnArrive.textContent = '我已到場';
+      if (loc.error) {
+        return toast(loc.error === 'DENIED' ? '簽到需要定位，請允許 LINE 使用定位後再按一次' : '目前無法取得定位，請確認手機已開啟定位', 'error');
+      }
+      rosterAct('arrive', loc, '已記錄到場');
     });
-    document.getElementById('btnRefresh').addEventListener('click', refreshRoster);
-    app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', onPersonAction));
+    app.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+      state.tab = b.dataset.tab;
+      drawSession();
+    }));
+    app.querySelectorAll('[data-court]').forEach((b) => b.addEventListener('click', () => {
+      state.court = b.dataset.court;
+      drawSession();
+    }));
+    const btnRefresh = document.getElementById('btnRefresh');
+    if (btnRefresh) btnRefresh.addEventListener('click', refreshRoster);
+    app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', onAction));
+  }
+
+  function courtChips() {
+    const r = state.roster;
+    if (r.courts.length < 2) return '';
+    return '<div class="chips">' + r.courts.map((c) =>
+      `<button data-court="${esc(c.id)}" class="${state.court === c.id ? 'on' : ''}">${esc(c.name)}</button>`).join('') + '</div>';
+  }
+
+  function gameOf(courtId) {
+    return state.roster.game.find((g) => g.id === courtId);
+  }
+
+  /* ----- 點名 ----- */
+
+  function drawRoll() {
+    const r = state.roster;
+    const can = r.session.editable;
+    const walkins = r.people.filter((p) => p.status === '現場待確認');
+    const groups = r.courts.map((c) => ({ id: c.id, name: c.name, people: r.people.filter((p) => p.status === '已報名' && p.court === c.id) }));
+    const none = r.people.filter((p) => p.status === '已報名' && !r.courts.some((c) => c.id === p.court));
+    if (none.length) groups.push({ id: '', name: '未分面', people: none });
+
+    let html = `<div class="listhead"><span>名單（${r.summary.registered}）</span><button class="link" id="btnRefresh">重新整理</button></div>`;
+    if (walkins.length) {
+      html += '<div class="group-title">現場待確認</div>' + walkins.map((p) => personRow(p, can)).join('');
+    }
+    groups.forEach((g) => {
+      const here = g.people.filter((p) => p.attend === '出席' && !p.left).length;
+      html += `<div class="group-title">${esc(g.name)}<span class="muted">　在場 ${here}／${g.people.length}</span></div>`;
+      html += g.people.length ? g.people.map((p) => personRow(p, can)).join('') : '<div class="card muted">沒有人</div>';
+    });
+    if (r.waitlist.length) {
+      html += `<div class="group-title">候補（${r.waitlist.length}）</div>`;
+      if (!r.session.started) html += '<p class="muted">開打前由系統自動遞補，開打後可在這裡讓現場的候補者上場。</p>';
+      html += r.waitlist.map((w) => `
+        <div class="card person">
+          <div class="row">
+            <div><div class="name">${w.rank}. ${esc(w.name)}</div><div class="muted">${esc(w.courtName || '未指定球面')}</div></div>
+            ${can && r.session.started ? `<div class="btns"><button class="btn sm" data-act="acceptWait" data-id="${esc(w.regId)}">接受上場</button></div>` : ''}
+          </div>
+        </div>`).join('');
+    }
+    return html;
   }
 
   function personRow(p, can) {
@@ -210,13 +319,18 @@
     const present = p.attend === '出席';
     const tags = [
       pending ? '<span class="tag orange">現場待確認</span>' : '',
+      p.left ? `<span class="tag">離場 ${esc(p.leftTime)}</span>` : '',
       p.isNew ? '<span class="tag blue">新人</span>' : '',
       p.isFree ? '<span class="tag">免費體驗</span>' : '',
       p.source === '現場' && !pending ? '<span class="tag">現場</span>' : '',
+      p.dupr ? `<span class="tag">DUPR ${esc(p.dupr)}</span>` : '',
     ].join('');
-    const pay = !p.hasAr ? '' : p.unpaid > 0
-      ? `<span class="due">未收 ${money(p.unpaid)}</span>`
-      : `<span class="paid">已收清</span>`;
+    let pay = '';
+    if (p.hasAr) {
+      if (p.unpaid > 0) pay = `<span class="due">未收 ${money(p.unpaid)}</span>${p.deadline ? `<span class="muted">（期限 ${esc(p.deadline)}）</span>` : ''}`;
+      else if (p.pending > 0) pay = '<span class="paid">已付・待對帳</span>';
+      else pay = '<span class="paid">已收清</span>';
+    }
 
     let buttons = '';
     if (can && pending) {
@@ -224,53 +338,404 @@
         <button class="btn sm" data-act="accept" data-id="${esc(p.regId)}">接受</button>
         <button class="btn sm ghost" data-act="decline" data-id="${esc(p.regId)}">婉拒</button>`;
     } else if (can) {
-      buttons = present
-        ? `<button class="btn sm ghost" data-act="undo" data-id="${esc(p.regId)}">取消簽到</button>`
-        : `<button class="btn sm" data-act="present" data-id="${esc(p.regId)}">簽到</button>`;
+      if (!present) buttons += `<button class="btn sm" data-act="present" data-id="${esc(p.regId)}">簽到</button>`;
       if (p.hasAr && p.unpaid > 0) buttons += `<button class="btn sm amber" data-act="collect" data-id="${esc(p.regId)}">收款</button>`;
+      buttons += `<button class="btn sm ghost" data-act="more" data-id="${esc(p.regId)}">更多</button>`;
     }
 
+    const status = present ? (p.left ? '已離場' : '✓ ' + esc(p.time) + ' 簽到') : pending ? '超過上限的現場報名' : '尚未簽到';
     return `
-      <div class="card person ${present ? 'present' : ''} ${pending ? 'pending' : ''}">
+      <div class="card person ${present && !p.left ? 'present' : ''} ${pending ? 'pending' : ''} ${p.left ? 'left' : ''}">
         <div class="row">
           <div>
             <div class="name">${esc(p.name)} ${tags}</div>
-            <div class="muted">${present ? '✓ ' + esc(p.time) + ' 簽到' : pending ? '超過上限的現場報名' : '尚未簽到'}　${pay}</div>
+            <div class="muted">${status}　${pay}</div>
           </div>
           <div class="btns">${buttons}</div>
         </div>
       </div>`;
   }
 
-  async function onPersonAction(ev) {
+  /* ----- 輪轉 ----- */
+
+  function drawRotation() {
+    const r = state.roster;
+    const g = gameOf(state.court);
+    if (!g) return '<div class="card muted">這場球敘沒有設定使用場地，請營運在 AppSheet 補上。</div>';
+    const can = r.session.editable;
+    const n = g.players.length;
+    let html = courtChips();
+    html += `<div class="card">
+      <div class="row"><div class="title">${esc(g.name)}　<span class="muted">上場 ${n} 人</span></div>
+      ${g.total ? `<span class="tag green">${g.done}／${g.total} 場</span>` : ''}</div>
+      <div class="letters">${g.players.map((p) => `<span><b>${p.letter}</b>${esc(p.name)}</span>`).join('') || '<span class="muted">還沒有人簽到</span>'}</div>
+    </div>`;
+
+    if (!g.total) {
+      if (n < 4) html += '<div class="card muted">這一面要 4～8 位已簽到的人才能產生輪轉表。人數不夠時可在「點名」把人換到這一面。</div>';
+      else if (n > 8) html += '<div class="card muted">超過 8 人，請先在「點名」把人分到其他面（每面 4～8 人）。</div>';
+      else if (can) {
+        html += `<div class="card">
+          ${g.options.length > 1 ? `<label class="inline">場數
+            <select id="gGames">${g.options.map((o) => `<option value="${o}" ${o === g.defaultGames ? 'selected' : ''}>${o} 場（每人 ${o * 4 / n} 場）</option>`).join('')}</select></label>
+            <p class="muted">${n} 人沒有完美的排法，系統以上場數平均、不重複搭檔、休息不連續為優先。</p>`
+            : `<p class="muted">${n} 人共 ${g.defaultGames} 場${n === 8 ? '，每兩人當隊友剛好一次、每人打 7 場' : n === 5 ? '，每場 1 人休息' : '，每兩人當一次隊友'}。</p>`}
+          <button class="btn block" data-act="generate">產生輪轉表</button>
+          <p class="muted">產生前請確認點名與分面；已有比分後不能重新產生，只能補場或改人。</p>
+        </div>`;
+      }
+      return html;
+    }
+
+    html += roundsTable(g, can);
+    if (can) {
+      html += '<div class="actions">';
+      if (!g.done) html += '<button class="btn ghost" data-act="regen">重新產生</button><button class="btn ghost" data-act="clear">清除</button>';
+      html += '<button class="btn ghost" data-act="addMatch">補場</button></div>';
+    }
+    return html;
+  }
+
+  function roundsTable(g, can) {
+    const byRound = {};
+    g.matches.forEach((m) => { (byRound[m.round] = byRound[m.round] || []).push(m); });
+    const queue = loadQueue();
+    return '<div class="card rounds">' + Object.keys(byRound).map(Number).sort((a, b) => a - b).map((rd) => `
+      <div class="round"><div class="rno">第 ${rd} 輪</div><div class="games">
+        ${byRound[rd].map((m) => {
+          const q = queue[m.id];
+          const score = q ? `<span class="tag orange">待上傳 ${q.sa}:${q.sb}</span>` : m.done ? `<b class="sc">${m.sa}:${m.sb}</b>` : '';
+          return `<button class="game ${m.done ? 'done' : ''} ${m.hasInactive ? 'warn' : ''}" ${can && !m.done ? `data-act="editMatch" data-id="${esc(m.id)}"` : 'disabled'}>
+            <span>${teamText(m.a)}</span><span class="vs">vs</span><span>${teamText(m.b)}</span>${score}
+            ${m.hasInactive ? '<span class="tag orange">含離場或已換面的人</span>' : ''}
+          </button>`;
+        }).join('')}
+      </div></div>`).join('') + '</div>';
+  }
+
+  function teamText(team) {
+    return team.map((p) => esc(p.name)).join('・');
+  }
+
+  /* ----- 比分 ----- */
+
+  function drawScores() {
+    const r = state.roster;
+    const g = gameOf(state.court);
+    let html = courtChips();
+    if (!g || !g.total) return html + '<div class="card muted">這一面還沒有輪轉表，請先到「輪轉」產生。</div>';
+    const queue = loadQueue();
+    html += '<p class="muted">點一場 → 點勝隊 → 輸入敗隊分數 → 儲存，會自動跳到下一場。已完成的也可以點開修改。</p>';
+    html += g.matches.map((m) => {
+      const q = queue[m.id];
+      const sa = q ? q.sa : m.sa;
+      const sb = q ? q.sb : m.sb;
+      const has = !!(q || m.done);
+      const st = q ? '<span class="tag orange">待上傳</span>' : m.done ? '<span class="tag green">已完成</span>' : '<span class="tag">未開始</span>';
+      return `<button class="card scorecard ${has ? 'done' : ''}" ${r.session.editable ? `data-act="score" data-id="${esc(m.id)}"` : 'disabled'}>
+        <div class="row"><span class="muted">第 ${m.round} 輪・第 ${m.seq} 場</span>${st}</div>
+        <div class="teams">
+          <div class="${has && sa > sb ? 'win' : ''}"><span>${teamText(m.a)}</span><b>${has ? sa : ''}</b></div>
+          <div class="${has && sb > sa ? 'win' : ''}"><span>${teamText(m.b)}</span><b>${has ? sb : ''}</b></div>
+        </div>
+      </button>`;
+    }).join('');
+    return html;
+  }
+
+  function openScore(m) {
+    const s = state.roster.session;
+    const q = loadQueue()[m.id];
+    let win = '';
+    const sa = q ? q.sa : m.sa;
+    const sb = q ? q.sb : m.sb;
+    if (sa !== null && sa !== undefined && sb !== null && sb !== undefined) win = sa > sb ? 'a' : 'b';
+
+    modal.innerHTML = `
+      <div class="sheet">
+        <h2>第 ${m.round} 輪・第 ${m.seq} 場</h2>
+        <p class="muted">點勝隊（自動帶入 ${s.points} 分），再輸入敗隊分數。${s.winBy2 ? '需贏 2 分。' : ''}</p>
+        <div class="pickwin">
+          <button data-win="a">${teamText(m.a)}</button>
+          <button data-win="b">${teamText(m.b)}</button>
+        </div>
+        <div class="scoreinputs">
+          <label>${teamText(m.a)}<input id="sA" type="number" inputmode="numeric" min="0"></label>
+          <label>${teamText(m.b)}<input id="sB" type="number" inputmode="numeric" min="0"></label>
+        </div>
+        <div id="sErr" class="warn-text"></div>
+        <div class="actions">
+          ${m.done ? '<button class="btn ghost" id="sReset">清除比分</button>' : ''}
+          <button class="btn ghost" id="sCancel">取消</button>
+          <button class="btn" id="sOk">儲存</button>
+        </div>
+      </div>`;
+    modal.hidden = false;
+    const inA = document.getElementById('sA');
+    const inB = document.getElementById('sB');
+    const errEl = document.getElementById('sErr');
+    if (sa !== null && sa !== undefined) inA.value = sa;
+    if (sb !== null && sb !== undefined) inB.value = sb;
+    const paint = () => modal.querySelectorAll('[data-win]').forEach((b) => b.classList.toggle('on', b.dataset.win === win));
+    paint();
+    modal.querySelectorAll('[data-win]').forEach((b) => b.addEventListener('click', () => {
+      win = b.dataset.win;
+      const winner = win === 'a' ? inA : inB;
+      const loser = win === 'a' ? inB : inA;
+      if (!winner.value || Number(winner.value) < s.points) winner.value = s.points;
+      if (loser.value !== '' && Number(loser.value) >= Number(winner.value)) loser.value = '';
+      paint();
+      loser.focus();
+    }));
+    document.getElementById('sCancel').addEventListener('click', closeModal);
+    const reset = document.getElementById('sReset');
+    if (reset) reset.addEventListener('click', () => {
+      if (!confirm('清除這一場的比分？')) return;
+      removeQueued(m.id);
+      rosterAct('resetScore', { matchId: m.id });
+    });
+    document.getElementById('sOk').addEventListener('click', () => {
+      const a = inA.value === '' ? NaN : Number(inA.value);
+      const b = inB.value === '' ? NaN : Number(inB.value);
+      const e = scoreError(a, b, s);
+      if (e) { errEl.textContent = e; return; }
+      saveScore(m, a, b);
+    });
+  }
+
+  /** 與 GAS scoreError_ 相同的檢查 */
+  function scoreError(sa, sb, rule) {
+    if (!isFinite(sa) || !isFinite(sb) || sa < 0 || sb < 0 || sa % 1 || sb % 1) return '比分要填 0 以上的整數';
+    if (sa === sb) return '比分不可平手';
+    const win = Math.max(sa, sb);
+    const lose = Math.min(sa, sb);
+    if (win < rule.points) return '勝隊至少要 ' + rule.points + ' 分';
+    if (rule.winBy2 && win - lose < 2) return '這場要贏 2 分以上';
+    return '';
+  }
+
+  /** 先存在手機，再送出；斷線時留在「待上傳」，恢復連線後自動送出 */
+  function saveScore(m, sa, sb) {
+    const q = loadQueue();
+    q[m.id] = { shiftId: state.shiftId, matchId: m.id, sa: sa, sb: sb, at: Date.now() };
+    saveQueue(q);
+    const g = gameOf(state.court);
+    const idx = g.matches.findIndex((x) => x.id === m.id);
+    const queued = loadQueue();
+    const next = g.matches.slice(idx + 1).concat(g.matches.slice(0, idx))
+      .find((x) => !x.done && !queued[x.id]);
+    closeModal();
+    drawSession();
+    flushScores();
+    if (next) openScore(next);
+    else toast('這一面的比分都輸入完了', 'ok');
+  }
+
+  async function flushScores() {
+    if (state.flushing) return;
+    const q = loadQueue();
+    const ids = Object.keys(q);
+    if (!ids.length) return;
+    state.flushing = true;
+    let changed = false;
+    try {
+      for (const id of ids) {
+        const item = q[id];
+        try {
+          const res = await api('saveScore', { shiftId: item.shiftId, matchId: item.matchId, sa: item.sa, sb: item.sb });
+          removeQueued(id);
+          changed = true;
+          if (item.shiftId === state.shiftId) state.roster = res;
+        } catch (e) {
+          if (e.code === 'NETWORK' || e.code === 'BAD_RESPONSE') break; // 還是斷線，下次再送
+          removeQueued(id);
+          changed = true;
+          toast('比分沒有存成功：' + e.message, 'error');
+        }
+      }
+    } finally {
+      state.flushing = false;
+    }
+    if (changed && state.page === 'checkin' && modal.hidden) drawSession();
+  }
+
+  function loadQueue() {
+    try {
+      return JSON.parse(localStorage.getItem(QUEUE_KEY) || '{}') || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveQueue(q) {
+    try {
+      localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+    } catch (e) { /* 無法存在手機時仍會直接送出 */ }
+  }
+
+  function removeQueued(id) {
+    const q = loadQueue();
+    delete q[id];
+    saveQueue(q);
+  }
+
+  /* ----- 積分 ----- */
+
+  function drawRank() {
+    const g = gameOf(state.court);
+    let html = courtChips();
+    if (!g || !g.standings.length) return html + '<div class="card muted">還沒有場次。</div>';
+    html += `<div class="card rank">
+      <div class="row"><div class="title">${esc(g.name)}</div><span class="muted">已完成 ${g.done}／${g.total} 場</span></div>
+      <table>
+        <thead><tr><th>#</th><th class="l">玩家</th><th>場</th><th>勝</th><th>敗</th><th>得</th><th>失</th><th>差</th></tr></thead>
+        <tbody>${g.standings.map((x) => `<tr>
+          <td>${x.rank}</td><td class="l">${esc(x.name)}</td><td>${x.played}</td><td><b>${x.win}</b></td><td>${x.lose}</td>
+          <td>${x.pf}</td><td>${x.pa}</td><td class="${x.diff > 0 ? 'pos' : x.diff < 0 ? 'neg' : ''}">${x.diff > 0 ? '+' : ''}${x.diff}</td></tr>`).join('')}
+        </tbody>
+      </table>
+      <p class="muted">排序：勝場 → 分差 → 得分。學員在學員帳號的球敘頁重新整理即可看到。</p>
+    </div>`;
+    return html;
+  }
+
+  /* ----- 動作 ----- */
+
+  function onAction(ev) {
     const b = ev.currentTarget;
-    const regId = b.dataset.id;
-    const person = state.roster.people.find((p) => p.regId === regId);
-    const shiftId = state.shiftId;
-    let res = null;
+    const id = b.dataset.id;
+    const r = state.roster;
+    const person = r.people.find((p) => p.regId === id);
+    const g = gameOf(state.court);
 
     switch (b.dataset.act) {
       case 'present':
-        res = await act(() => api('checkin', { shiftId, regId, attend: '出席' }), person.name + ' 已簽到');
-        break;
-      case 'undo':
-        if (!confirm('取消 ' + person.name + ' 的簽到？')) return;
-        res = await act(() => api('checkin', { shiftId, regId, attend: '未簽到' }), '已取消簽到');
-        break;
+        return rosterAct('checkin', { regId: id, attend: '出席' }, person.name + ' 已簽到');
       case 'accept':
-        if (!confirm('接受 ' + person.name + ' 的現場報名？\n會成立報名、建立應收並完成簽到。')) return;
-        res = await act(() => api('walkin', { shiftId, regId, decision: 'accept' }), '已接受');
-        break;
+        return chooseCourt('接受 ' + person.name + ' 的現場報名', '會成立報名、建立應收並完成簽到。', person.court,
+          (courtId) => rosterAct('walkin', { regId: id, decision: 'accept', courtId: courtId }, '已接受'));
       case 'decline':
-        if (!confirm('婉拒 ' + person.name + ' 的現場報名？')) return;
-        res = await act(() => api('walkin', { shiftId, regId, decision: 'decline' }), '已婉拒');
-        break;
+        if (!confirm('婉拒 ' + person.name + ' 的現場報名？')) return null;
+        return rosterAct('walkin', { regId: id, decision: 'decline' }, '已婉拒');
+      case 'acceptWait': {
+        const w = r.waitlist.find((x) => x.regId === id);
+        return chooseCourt('讓候補的 ' + w.name + ' 上場', '會改為已報名、建立應收並完成簽到。', w.court,
+          (courtId) => rosterAct('acceptWait', { regId: id, courtId: courtId }, '已接受上場'));
+      }
       case 'collect':
         return openCollect(person);
+      case 'more':
+        return openMore(person);
+      case 'generate': {
+        const sel = document.getElementById('gGames');
+        return rosterAct('generate', { courtId: state.court, games: sel ? Number(sel.value) : undefined });
+      }
+      case 'regen':
+        if (!confirm('重新產生 ' + g.name + ' 的輪轉表？目前的場次會被取代。')) return null;
+        return rosterAct('generate', { courtId: state.court, games: g.options.length > 1 ? g.total : undefined });
+      case 'clear':
+        if (!confirm('清除 ' + g.name + ' 的輪轉表？')) return null;
+        return rosterAct('clearRotation', { courtId: state.court });
+      case 'addMatch':
+        return openMatchEditor(null);
+      case 'editMatch':
+        return openMatchEditor(g.matches.find((m) => m.id === id));
+      case 'score':
+        return openScore(g.matches.find((m) => m.id === id));
       default:
-        return;
+        return null;
     }
-    if (res) { state.roster = res; drawRoster(); }
+  }
+
+  /** 選球面：只有一面時直接用 */
+  function chooseCourt(title, note, preset, done) {
+    const courts = state.roster.courts;
+    if (courts.length <= 1) {
+      if (!confirm(title + '？\n' + note)) return;
+      done(courts.length ? courts[0].id : '');
+      return;
+    }
+    modal.innerHTML = `
+      <div class="sheet">
+        <h2>${esc(title)}</h2>
+        <p class="muted">${esc(note)}請選擇球面：</p>
+        <div class="choice">${courts.map((c) => `<button class="btn ${c.id === preset ? '' : 'ghost'}" data-c="${esc(c.id)}">${esc(c.name)}</button>`).join('')}</div>
+        <div class="actions"><button class="btn ghost" id="mCancel">取消</button></div>
+      </div>`;
+    modal.hidden = false;
+    document.getElementById('mCancel').addEventListener('click', closeModal);
+    modal.querySelectorAll('[data-c]').forEach((b) => b.addEventListener('click', () => done(b.dataset.c)));
+  }
+
+  /** 更多：換面、離場、取消簽到 */
+  function openMore(p) {
+    const r = state.roster;
+    const present = p.attend === '出席';
+    const g = r.game.find((x) => x.id === p.court);
+    const hasTodo = g && g.matches.some((m) => !m.done);
+    const others = r.courts.filter((c) => c.id !== p.court);
+    modal.innerHTML = `
+      <div class="sheet">
+        <h2>${esc(p.name)}</h2>
+        <p class="muted">${esc(p.courtName || '未分面')}　${present ? (p.left ? '已離場' : '在場') : '尚未簽到'}</p>
+        ${others.length ? `<div class="group-title">換到其他面</div>
+          <div class="choice">${others.map((c) => `<button class="btn ghost" data-move="${esc(c.id)}">${esc(c.name)}</button>`).join('')}</div>
+          ${p.inMatch ? '<p class="muted">他還有這一面未開始的場次，不能換面；請先清除該面輪轉表，或用「離場並重排」。</p>' : ''}` : ''}
+        <div class="group-title">中途離場</div>
+        ${p.left
+          ? '<button class="btn ghost block" id="mUndoLeave">取消離場</button>'
+          : present
+            ? (hasTodo
+              ? `<button class="btn block" id="mLeaveRe">離場並重排剩餘場次</button>
+                 <button class="btn ghost block" id="mLeave">只標記離場（之後自己改人）</button>
+                 <p class="muted">重排：這一面未開始的場次會用剩下的人重新排；已完成的比分保留。</p>`
+              : '<button class="btn ghost block" id="mLeave">標記離場</button>')
+            : '<p class="muted">尚未簽到。</p>'}
+        ${present && !p.left ? '<button class="btn ghost block" id="mUndoCheck">取消簽到（簽錯人時）</button>' : ''}
+        <div class="actions"><button class="btn ghost" id="mCancel">關閉</button></div>
+      </div>`;
+    modal.hidden = false;
+    const on = (sel, fn) => { const el = document.getElementById(sel); if (el) el.addEventListener('click', fn); };
+    on('mCancel', closeModal);
+    on('mUndoLeave', () => rosterAct('leave', { regId: p.regId, undo: true }));
+    on('mLeaveRe', () => rosterAct('leave', { regId: p.regId, reschedule: true }));
+    on('mLeave', () => rosterAct('leave', { regId: p.regId }));
+    on('mUndoCheck', () => rosterAct('checkin', { regId: p.regId, attend: '未簽到' }, '已取消簽到'));
+    modal.querySelectorAll('[data-move]').forEach((b) => b.addEventListener('click', () =>
+      rosterAct('moveCourt', { regId: p.regId, courtId: b.dataset.move }, '已換到 ' + b.textContent)));
+  }
+
+  /** 補場（m＝null）或改人／刪除未開始的場次 */
+  function openMatchEditor(m) {
+    const g = gameOf(state.court);
+    if (g.players.length < 4) { toast('這一面在場不到 4 人', 'error'); return; }
+    const cur = m ? m.a.concat(m.b).map((x) => x.id) : g.players.slice(0, 4).map((x) => x.id);
+    const sel = (i) => `<select data-slot="${i}">${g.players.map((p) =>
+      `<option value="${esc(p.id)}" ${p.id === cur[i] ? 'selected' : ''}>${p.letter} ${esc(p.name)}</option>`).join('')}
+      ${cur[i] && !g.players.some((p) => p.id === cur[i]) ? '<option value="" selected>（不在這一面，請換人）</option>' : ''}</select>`;
+    modal.innerHTML = `
+      <div class="sheet">
+        <h2>${m ? '第 ' + m.round + ' 輪・第 ' + m.seq + ' 場' : '補一場（' + esc(g.name) + '）'}</h2>
+        <div class="teamedit"><div><b>A 隊</b>${sel(0)}${sel(1)}</div><div><b>B 隊</b>${sel(2)}${sel(3)}</div></div>
+        <div class="actions">
+          ${m ? '<button class="btn ghost" id="eDel">刪除這一場</button>' : ''}
+          <button class="btn ghost" id="eCancel">取消</button>
+          <button class="btn" id="eOk">${m ? '儲存' : '新增'}</button>
+        </div>
+      </div>`;
+    modal.hidden = false;
+    document.getElementById('eCancel').addEventListener('click', closeModal);
+    const del = document.getElementById('eDel');
+    if (del) del.addEventListener('click', () => {
+      if (!confirm('刪除這一場？')) return;
+      rosterAct('deleteMatch', { matchId: m.id });
+    });
+    document.getElementById('eOk').addEventListener('click', () => {
+      const players = Array.from(modal.querySelectorAll('[data-slot]')).map((s) => s.value);
+      if (new Set(players).size !== 4 || players.some((x) => !x)) { toast('四位選手不可重複', 'error'); return; }
+      if (m) rosterAct('editMatch', { matchId: m.id, players: players });
+      else rosterAct('addMatch', { courtId: state.court, players: players });
+    });
   }
 
   function openCollect(p) {
@@ -297,17 +762,13 @@
       document.getElementById('cLast5Wrap').hidden = method.value !== '轉帳';
     });
     document.getElementById('cCancel').addEventListener('click', closeModal);
-    document.getElementById('cOk').addEventListener('click', async () => {
-      const res = await act(() => api('collect', {
-        shiftId: state.shiftId,
-        regId: p.regId,
-        amount: document.getElementById('cAmount').value,
-        method: method.value,
-        last5: document.getElementById('cLast5').value,
-        note: document.getElementById('cNote').value,
-      }), '已記錄收款');
-      if (res) { closeModal(); state.roster = res; drawRoster(); }
-    });
+    document.getElementById('cOk').addEventListener('click', () => rosterAct('collect', {
+      regId: p.regId,
+      amount: document.getElementById('cAmount').value,
+      method: method.value,
+      last5: document.getElementById('cLast5').value,
+      note: document.getElementById('cNote').value,
+    }, '已記錄收款'));
   }
 
   function closeModal() {
@@ -316,10 +777,10 @@
   }
 
   async function refreshRoster() {
-    if (state.busy || !modal.hidden) return;
+    if (state.busy || !modal.hidden || !state.shiftId) return;
     try {
       state.roster = await api('roster', { shiftId: state.shiftId });
-      if (state.page === 'checkin') drawRoster();
+      if (state.page === 'checkin' && modal.hidden) drawSession();
     } catch (e) {
       if (e.code === 'AUTH_EXPIRED') { stopPoll(); toast(e.message, 'error'); }
     }
@@ -354,12 +815,14 @@
     const s = r.session;
     const sh = r.shift;
     const sum = r.summary;
+    const notDone = r.game.reduce((n, g) => n + (g.total - g.done), 0);
 
     app.innerHTML = `
       <h1>收班回報</h1>
       <div class="card head">
         <div class="title">${esc(s.name)}</div>
         <div class="muted">${esc(s.date)}　${esc(s.start)}–${esc(s.end)}　${esc(s.venue)}</div>
+        ${notDone ? `<p class="warn-text">還有 ${notDone} 場沒有比分；沒打的場次可在「輪轉」刪除。</p>` : ''}
       </div>
       <form id="fReport" class="card form">
         <div class="cashbox">
@@ -414,7 +877,7 @@
     app.innerHTML = `
       <h1>${isRegister ? '場主註冊' : '我的資料'}</h1>
       <form id="fProfile" class="card form">
-        ${isRegister ? '<p class="muted">送出後由總場主審核，核准後即可使用排班與簽到。</p>' : ''}
+        ${isRegister ? '<p class="muted">送出後由總場主審核，核准後即可使用排班與點名。</p>' : ''}
         <label>姓名<input name="name" required maxlength="20" value="${esc(p.name || state.me.lineName || '')}" ${isRegister ? '' : 'disabled'}></label>
         <label>手機<input name="phone" type="tel" inputmode="tel" required placeholder="0912345678" value="${esc(p.phone || '')}"></label>
         <label>Email<input name="email" type="email" required placeholder="常用的 Gmail" value="${esc(p.email || '')}"></label>
