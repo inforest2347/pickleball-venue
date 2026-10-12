@@ -127,7 +127,86 @@ h2 { font-size: 18px; margin: 0 0 8px; }
   position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%) translateY(20px);
   background: #333; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: 14px;
   opacity: 0; transition: .2s; z-index: 20; max-width: calc(100% - 32px); text-align: center;
+  pointer-events: none;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.ok { background: var(--brand); }
 .toast.error { background: var(--red); }
+
+/* ---------- v2：今日球敘（點名・輪轉・比分・積分） ---------- */
+.seg {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin: 4px 0 12px;
+  background: #e6ebe8; border-radius: 12px; padding: 4px; position: sticky; top: 48px; z-index: 4;
+}
+.seg button {
+  appearance: none; border: 0; background: none; padding: 9px 0; border-radius: 9px;
+  font: inherit; font-size: 15px; color: var(--muted); cursor: pointer;
+}
+.seg button.on { background: #fff; color: var(--brand); font-weight: 700; box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
+
+.chips { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 10px; }
+.chips button {
+  appearance: none; border: 1px solid var(--line); background: #fff; border-radius: 999px;
+  padding: 6px 16px; font: inherit; font-size: 14px; color: var(--text); white-space: nowrap; cursor: pointer;
+}
+.chips button.on { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 600; }
+
+.group-title { font-weight: 700; margin: 16px 2px 8px; }
+.person.left { opacity: .6; }
+.offline { margin-top: 10px; padding: 8px 10px; border-radius: 8px; background: var(--orange-soft); color: var(--orange); font-size: 14px; }
+
+.letters { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 10px; font-size: 14px; }
+.letters b {
+  display: inline-block; width: 22px; height: 22px; line-height: 22px; text-align: center; margin-right: 4px;
+  border-radius: 50%; background: var(--brand-soft); color: var(--brand); font-size: 12px;
+}
+label.inline { display: block; font-size: 14px; font-weight: 600; }
+label.inline select { display: block; width: 100%; margin-top: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+
+.rounds { padding: 4px 14px; }
+.round { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.round:last-child { border-bottom: 0; }
+.rno { flex: 0 0 52px; font-size: 13px; color: var(--muted); padding-top: 8px; }
+.games { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.game {
+  appearance: none; text-align: left; font: inherit; font-size: 14px; color: var(--text);
+  border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 8px 10px; cursor: pointer;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+}
+.game:disabled { cursor: default; color: var(--text); }
+.game.done { background: var(--brand-soft); border-color: #c9ddd2; }
+.game.warn { border-color: var(--orange); background: var(--orange-soft); }
+.game .vs { color: var(--muted); font-size: 12px; }
+.game .sc { margin-left: auto; color: var(--brand); }
+
+.scorecard { display: block; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
+.scorecard:disabled { cursor: default; }
+.scorecard.done { border-color: #c9ddd2; }
+.teams { margin-top: 8px; display: grid; gap: 4px; }
+.teams > div { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 6px; background: #f6f8f7; }
+.teams > div b { font-size: 20px; min-width: 32px; text-align: right; }
+.teams > div.win { background: var(--brand-soft); font-weight: 700; color: var(--brand); }
+
+.pickwin { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0 4px; }
+.pickwin button {
+  appearance: none; border: 2px solid var(--line); background: #fff; border-radius: 10px; padding: 14px 8px;
+  font: inherit; font-size: 15px; color: var(--text); cursor: pointer;
+}
+.pickwin button.on { border-color: var(--brand); background: var(--brand-soft); color: var(--brand); font-weight: 700; }
+.pickwin button.on::before { content: '勝 '; }
+.scoreinputs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.scoreinputs input { font-size: 22px; text-align: center; }
+
+.choice { display: flex; flex-wrap: wrap; gap: 8px; }
+.choice .btn { flex: 1 1 40%; }
+.teamedit { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
+.teamedit select { display: block; width: 100%; margin-top: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+.sheet { max-height: 88vh; overflow-y: auto; }
+
+.rank table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+.rank th { font-weight: 600; color: var(--muted); font-size: 12px; padding: 6px 2px; border-bottom: 1px solid var(--line); }
+.rank td { text-align: center; padding: 8px 2px; border-bottom: 1px solid #eef1ef; }
+.rank .l { text-align: left; }
+.rank tbody tr:nth-child(-n+3) td:first-child { color: var(--brand); font-weight: 700; }
+.pos { color: var(--brand); }
+.neg { color: var(--red); }
