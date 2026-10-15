@@ -210,3 +210,7 @@ label.inline select { display: block; width: 100%; margin-top: 4px; padding: 10p
 .rank tbody tr:nth-child(-n+3) td:first-child { color: var(--brand); font-weight: 700; }
 .pos { color: var(--brand); }
 .neg { color: var(--red); }
+
+/* ---------- v2.2：先顯示上次的資料 ---------- */
+.stalebar { margin-top: 10px; padding: 6px 10px; border-radius: 8px; background: #eef1ef; color: var(--muted); font-size: 13px; text-align: center; }
+body.stale #app .btn, body.stale #app [data-act] { opacity: .55; pointer-events: none; }

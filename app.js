@@ -1,5 +1,6 @@
 /**
- * venue/app.js — 場主 LIFF 頁面　v2（2026/10/11）
+ * venue/app.js — 場主 LIFF 頁面　v2.2（2026/10/15：讀取優化；含 v2.1 我已到場定位）
+ * v2.2：開頁一次 init、先顯示上次的資料再更新、30 秒輪詢只比對簽章、比分與簽到先更新畫面
  * 頁面：shifts 我的排班／checkin 今日球敘（點名・輪轉・比分・積分）／report 收班回報／profile 我的資料
  * 網址：https://liff.line.me/{LIFF_ID}?page=checkin（可加 &shift=排班ID&tab=score）
  */
@@ -18,10 +19,13 @@
   const POLL_MS = 30000;
   const FLUSH_MS = 15000;
   const QUEUE_KEY = 'venue.pendingScores.v1';
+  const SNAP_KEY = 'venue.snapshot.v2';   // 上次的 me、排班、名單（開頁先顯示）
+  const FULL_EVERY = 5;                    // 輪詢每 5 次（約 2.5 分鐘）抓一次完整名單（含收款變化）
 
   const state = {
     me: null, page: 'shifts', tab: 'roll', shiftId: '', roster: null, court: '',
     pollTimer: null, flushTimer: null, busy: false, flushing: false,
+    shifts: null, stale: false, pollCount: 0,
   };
   const app = document.getElementById('app');
   const modal = document.getElementById('modal');
@@ -38,15 +42,69 @@
       state.page = PAGES.indexOf(p.get('page')) >= 0 ? p.get('page') : 'shifts';
       state.shiftId = p.get('shift') || '';
       if (TABS.some((t) => t[0] === p.get('tab'))) state.tab = p.get('tab');
-      state.me = await api('me');
-      document.getElementById('who').textContent = state.me.profile ? state.me.profile.name : state.me.lineName;
       window.addEventListener('online', flushScores);
       state.flushTimer = setInterval(flushScores, FLUSH_MS);
+
+      // 先用上次的資料畫出畫面（標示更新中），同時向伺服器要最新資料
+      const snap = loadSnap();
+      if (snap && snap.me && snap.me.state === 'active') {
+        state.me = snap.me;
+        state.shifts = snap.shifts || null;
+        if (!state.shiftId && state.page !== 'shifts' && snap.roster && snap.roster.session.date === todayStr()) state.shiftId = snap.shiftId;
+        if (snap.roster && snap.shiftId === state.shiftId) state.roster = snap.roster;
+        setStale(true);
+        showWho();
+        const canShow = state.page === 'profile' || (state.page === 'shifts' && state.shifts) ||
+          ((state.page === 'checkin' || state.page === 'report') && state.roster);
+        if (canShow) route();
+      }
+
+      const init = await api('init', { page: state.page, shiftId: state.shiftId });
+      state.me = init.me;
+      state.shifts = init.shifts || null;
+      if (init.shiftId) state.shiftId = init.shiftId;
+      state.roster = init.roster || (state.shiftId && init.shiftId === state.shiftId ? state.roster : null);
+      if (state.shiftId && !init.roster && state.page !== 'shifts') state.shiftId = '';
+      state.shiftsStale = false;
+      setStale(false);
+      saveSnap();
+      showWho();
       route();
       flushScores();
     } catch (e) {
       showFatal(e);
     }
+  }
+
+  function showWho() {
+    document.getElementById('who').textContent = state.me.profile ? state.me.profile.name : state.me.lineName;
+  }
+
+  function todayStr() {
+    const d = new Date();
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  /** 顯示上次資料時：按鈕暫停使用，頂端顯示「更新中」 */
+  function setStale(on) {
+    state.stale = on;
+    document.body.classList.toggle('stale', on);
+  }
+
+  function loadSnap() {
+    try {
+      return JSON.parse(localStorage.getItem(SNAP_KEY) || 'null');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveSnap() {
+    try {
+      localStorage.setItem(SNAP_KEY, JSON.stringify({
+        at: Date.now(), me: state.me, shifts: state.shifts, shiftId: state.shiftId, roster: state.roster,
+      }));
+    } catch (e) { /* 手機不能存時略過 */ }
   }
 
   function showFatal(e) {
@@ -126,23 +184,45 @@
   async function rosterAct(action, data, okMsg) {
     const res = await act(() => api(action, Object.assign({ shiftId: state.shiftId }, data)), okMsg);
     if (res) {
-      state.roster = res;
+      applyResult(res);
       closeModal();
       drawSession();
     }
     return res;
   }
 
+  /** 輪轉、比分類動作只回傳 game 與簽章；其他動作回傳完整名單 */
+  function applyResult(res) {
+    if (res.people) state.roster = res;
+    else if (res.game && state.roster) {
+      state.roster.game = res.game;
+      state.roster.sig = res.sig;
+    }
+    saveSnap();
+  }
+
   /* ---------- 我的排班 ---------- */
 
   async function renderShifts() {
-    loading();
-    let list;
-    try {
-      list = await api('myShifts');
-    } catch (e) {
-      return showFatal(e);
+    let list = state.shifts;
+    if (!list || state.shiftsStale) {
+      if (list) drawShifts(list); else loading();
+      try {
+        list = state.shifts = await api('myShifts');
+        state.shiftsStale = false;
+        saveSnap();
+      } catch (e) {
+        if (!state.shifts) return showFatal(e);
+        toast(e.message, 'error');
+        return null;
+      }
+      if (state.page !== 'shifts') return null;
     }
+    state.shiftsStale = true; // 下次切回排班頁時重新整理
+    return drawShifts(list);
+  }
+
+  function drawShifts(list) {
     if (!list.length) return renderNotice('目前沒有排班', '排班由營運安排，有新的排班時會在前一晚提醒你。');
 
     app.innerHTML = '<h1>我的排班</h1>' + list.map((s) => `
@@ -169,8 +249,11 @@
   /** 沒有指定排班時：今天只有一場就直接用，多場就讓人選 */
   async function pickShift(page) {
     if (state.shiftId) return state.shiftId;
-    loading();
-    const list = (await api('myShifts')).filter((s) => s.editable && s.sessionStatus !== '取消');
+    if (!state.shifts) {
+      loading();
+      state.shifts = await api('myShifts');
+    }
+    const list = state.shifts.filter((s) => s.editable && s.sessionStatus !== '取消');
     const today = list.filter((s) => s.isToday);
     const candidates = today.length ? today : list;
     if (candidates.length === 1) return (state.shiftId = candidates[0].shiftId);
@@ -195,14 +278,17 @@
     try {
       shiftId = await pickShift('checkin');
       if (!shiftId) return;
-      loading();
-      state.roster = await api('roster', { shiftId: shiftId });
+      if (!state.roster || state.roster.shift.shiftId !== shiftId) {
+        loading();
+        state.roster = await api('roster', { shiftId: shiftId });
+        saveSnap();
+      }
     } catch (e) {
       state.shiftId = '';
       return showFatal(e);
     }
     drawSession();
-    startPoll();
+    if (!state.stale) startPoll();
   }
 
   function drawSession() {
@@ -236,6 +322,7 @@
           : s.editable ? '<button class="btn block" id="btnArrive">我已到場</button><p class="muted" style="text-align:center;margin:6px 0 0">開始前 30 分鐘起、在場地附近才能簽到</p>' : ''}
         ${!s.editable ? '<p class="muted">此場次目前不可修改（只能在球敘當天或隔天操作）。</p>' : ''}
         ${pendingN ? `<div class="offline">⚠ ${pendingN} 筆比分待上傳，恢復連線後會自動送出</div>` : ''}
+        ${state.stale ? '<div class="stalebar">顯示上次的資料，更新中…</div>' : ''}
       </div>
       <div class="seg" role="tablist">
         ${TABS.map((t) => `<button data-tab="${t[0]}" class="${state.tab === t[0] ? 'on' : ''}">${t[1]}</button>`).join('')}
@@ -545,7 +632,7 @@
           const res = await api('saveScore', { shiftId: item.shiftId, matchId: item.matchId, sa: item.sa, sb: item.sb });
           removeQueued(id);
           changed = true;
-          if (item.shiftId === state.shiftId) state.roster = res;
+          if (item.shiftId === state.shiftId) applyResult(res);
         } catch (e) {
           if (e.code === 'NETWORK' || e.code === 'BAD_RESPONSE') break; // 還是斷線，下次再送
           removeQueued(id);
@@ -609,8 +696,15 @@
     const g = gameOf(state.court);
 
     switch (b.dataset.act) {
-      case 'present':
-        return rosterAct('checkin', { regId: id, attend: '出席' }, person.name + ' 已簽到');
+      case 'present': {
+        // 先更新畫面，再送出；失敗時 rosterAct 會提示，並重新整理名單
+        const now = new Date();
+        person.attend = '出席';
+        person.time = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+        drawSession();
+        return rosterAct('checkin', { regId: id, attend: '出席' }, person.name + ' 已簽到')
+          .then((res) => { if (!res) refreshRoster(true); });
+      }
       case 'accept':
         return chooseCourt('接受 ' + person.name + ' 的現場報名', '會成立報名、建立應收並完成簽到。', person.court,
           (courtId) => rosterAct('walkin', { regId: id, decision: 'accept', courtId: courtId }, '已接受'));
@@ -776,21 +870,36 @@
     modal.innerHTML = '';
   }
 
-  async function refreshRoster() {
-    if (state.busy || !modal.hidden || !state.shiftId) return;
+  /** 抓完整名單（force＝不管是否有視窗開著） */
+  async function refreshRoster(force) {
+    if (!state.shiftId || (!force && (state.busy || !modal.hidden))) return;
     try {
       state.roster = await api('roster', { shiftId: state.shiftId });
+      saveSnap();
       if (state.page === 'checkin' && modal.hidden) drawSession();
     } catch (e) {
       if (e.code === 'AUTH_EXPIRED') { stopPoll(); toast(e.message, 'error'); }
     }
   }
 
-  /** 學員會用據點 QR 自助簽到，名單每 30 秒自動更新 */
+  /** 30 秒輪詢：先比對簽章（只讀報名與對戰），有變動或每 5 次才抓完整名單 */
+  async function pollRoster() {
+    if (state.busy || !modal.hidden || !state.shiftId || !state.roster) return;
+    state.pollCount += 1;
+    if (state.pollCount % FULL_EVERY === 0) return refreshRoster();
+    try {
+      const r = await api('poll', { shiftId: state.shiftId, sig: state.roster.sig });
+      if (r.changed) refreshRoster();
+    } catch (e) {
+      if (e.code === 'AUTH_EXPIRED') { stopPoll(); toast(e.message, 'error'); }
+    }
+  }
+
+  /** 學員會用據點 QR 自助簽到，名單每 30 秒檢查一次 */
   function startPoll() {
     stopPoll();
     state.pollTimer = setInterval(() => {
-      if (document.visibilityState === 'visible') refreshRoster();
+      if (document.visibilityState === 'visible') pollRoster();
     }, POLL_MS);
   }
 
@@ -806,8 +915,12 @@
     try {
       const shiftId = await pickShift('report');
       if (!shiftId) return;
-      loading();
-      r = state.roster = await api('roster', { shiftId: shiftId });
+      if (!state.roster || state.roster.shift.shiftId !== shiftId || state.stale) {
+        loading();
+        state.roster = await api('roster', { shiftId: shiftId });
+        saveSnap();
+      }
+      r = state.roster;
     } catch (e) {
       state.shiftId = '';
       return showFatal(e);
@@ -866,7 +979,7 @@
         venueIssue: form.venueIssue.value,
         issue: form.issue.value,
       }), '回報已送出');
-      if (res) state.roster = res;
+      if (res) applyResult(res);
     });
   }
 
@@ -891,10 +1004,10 @@
       const data = { name: form.name.value, phone: form.phone.value, email: form.email.value };
       if (isRegister) {
         const res = await act(() => api('register', data), '已送出');
-        if (res) { state.me = await api('me'); route(); }
+        if (res) { state.me = await api('me'); saveSnap(); route(); }
       } else {
         const res = await act(() => api('updateProfile', data), '已儲存');
-        if (res) state.me = res;
+        if (res) { state.me = res; saveSnap(); }
       }
     });
   }
