@@ -310,7 +310,7 @@
     app.innerHTML = `
       <div class="card head">
         <div class="title">${esc(s.name)} <span class="tag ${s.type === '不限' ? '' : 'blue'}">${esc(s.type)}</span></div>
-        <div class="muted">${esc(s.date)}　${esc(s.start)}–${esc(s.end)}　${esc(s.venue)}　每場 ${s.points} 分${s.winBy2 ? '・需贏 2 分' : ''}</div>
+        <div class="muted">${esc(s.date)}　${esc(s.start)}–${esc(s.end)}　${esc(s.venue)}</div>
         <div class="stats">
           <div><b>${sum.present}</b><span>在場</span></div>
           <div><b>${sum.registered}</b><span>報名／上限 ${s.capacity || '—'}</span></div>
@@ -512,7 +512,7 @@
     let html = courtChips();
     if (!g || !g.total) return html + '<div class="card muted">這一面還沒有輪轉表，請先到「輪轉」產生。</div>';
     const queue = loadQueue();
-    html += '<p class="muted">點一場 → 點勝隊 → 輸入敗隊分數 → 儲存，會自動跳到下一場。已完成的也可以點開修改。</p>';
+    html += '<p class="muted">點一場 → 輸入兩隊比分 → 儲存，會自動跳到下一場。已完成的也可以點開修改。</p>';
     html += g.matches.map((m) => {
       const q = queue[m.id];
       const sa = q ? q.sa : m.sa;
@@ -522,33 +522,27 @@
       return `<button class="card scorecard ${has ? 'done' : ''}" ${r.session.editable ? `data-act="score" data-id="${esc(m.id)}"` : 'disabled'}>
         <div class="row"><span class="muted">第 ${m.round} 輪・第 ${m.seq} 場</span>${st}</div>
         <div class="teams">
-          <div class="${has && sa > sb ? 'win' : ''}"><span>${teamText(m.a)}</span><b>${has ? sa : ''}</b></div>
-          <div class="${has && sb > sa ? 'win' : ''}"><span>${teamText(m.b)}</span><b>${has ? sb : ''}</b></div>
+          <div><span>${teamText(m.a)}</span><b>${has ? sa : ''}</b></div>
+          <div><span>${teamText(m.b)}</span><b>${has ? sb : ''}</b></div>
         </div>
       </button>`;
     }).join('');
     return html;
   }
 
+  /** 比分輸入：直接填兩隊分數（不選勝隊、不限分數、可平手） */
   function openScore(m) {
-    const s = state.roster.session;
     const q = loadQueue()[m.id];
-    let win = '';
     const sa = q ? q.sa : m.sa;
     const sb = q ? q.sb : m.sb;
-    if (sa !== null && sa !== undefined && sb !== null && sb !== undefined) win = sa > sb ? 'a' : 'b';
 
     modal.innerHTML = `
       <div class="sheet">
         <h2>第 ${m.round} 輪・第 ${m.seq} 場</h2>
-        <p class="muted">點勝隊（自動帶入 ${s.points} 分），再輸入敗隊分數。${s.winBy2 ? '需贏 2 分。' : ''}</p>
-        <div class="pickwin">
-          <button data-win="a">${teamText(m.a)}</button>
-          <button data-win="b">${teamText(m.b)}</button>
-        </div>
+        <p class="muted">輸入兩隊的比分（可平手）。</p>
         <div class="scoreinputs">
-          <label>${teamText(m.a)}<input id="sA" type="number" inputmode="numeric" min="0"></label>
-          <label>${teamText(m.b)}<input id="sB" type="number" inputmode="numeric" min="0"></label>
+          <label>${teamText(m.a)}<input id="sA" type="number" inputmode="numeric" min="0" max="99"></label>
+          <label>${teamText(m.b)}<input id="sB" type="number" inputmode="numeric" min="0" max="99"></label>
         </div>
         <div id="sErr" class="warn-text"></div>
         <div class="actions">
@@ -563,17 +557,9 @@
     const errEl = document.getElementById('sErr');
     if (sa !== null && sa !== undefined) inA.value = sa;
     if (sb !== null && sb !== undefined) inB.value = sb;
-    const paint = () => modal.querySelectorAll('[data-win]').forEach((b) => b.classList.toggle('on', b.dataset.win === win));
-    paint();
-    modal.querySelectorAll('[data-win]').forEach((b) => b.addEventListener('click', () => {
-      win = b.dataset.win;
-      const winner = win === 'a' ? inA : inB;
-      const loser = win === 'a' ? inB : inA;
-      if (!winner.value || Number(winner.value) < s.points) winner.value = s.points;
-      if (loser.value !== '' && Number(loser.value) >= Number(winner.value)) loser.value = '';
-      paint();
-      loser.focus();
-    }));
+    inA.focus();
+    inA.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') inB.focus(); });
+    inB.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') document.getElementById('sOk').click(); });
     document.getElementById('sCancel').addEventListener('click', closeModal);
     const reset = document.getElementById('sReset');
     if (reset) reset.addEventListener('click', () => {
@@ -584,20 +570,16 @@
     document.getElementById('sOk').addEventListener('click', () => {
       const a = inA.value === '' ? NaN : Number(inA.value);
       const b = inB.value === '' ? NaN : Number(inB.value);
-      const e = scoreError(a, b, s);
+      const e = scoreError(a, b);
       if (e) { errEl.textContent = e; return; }
       saveScore(m, a, b);
     });
   }
 
-  /** 與 GAS scoreError_ 相同的檢查 */
-  function scoreError(sa, sb, rule) {
+  /** 與 GAS scoreError_ 相同的檢查：0 以上的整數即可 */
+  function scoreError(sa, sb) {
     if (!isFinite(sa) || !isFinite(sb) || sa < 0 || sb < 0 || sa % 1 || sb % 1) return '比分要填 0 以上的整數';
-    if (sa === sb) return '比分不可平手';
-    const win = Math.max(sa, sb);
-    const lose = Math.min(sa, sb);
-    if (win < rule.points) return '勝隊至少要 ' + rule.points + ' 分';
-    if (rule.winBy2 && win - lose < 2) return '這場要贏 2 分以上';
+    if (sa > 99 || sb > 99) return '比分太大，請確認';
     return '';
   }
 
@@ -773,8 +755,9 @@
         <h2>${esc(p.name)}</h2>
         <p class="muted">${esc(p.courtName || '未分面')}　${present ? (p.left ? '已離場' : '在場') : '尚未簽到'}</p>
         ${others.length ? `<div class="group-title">換到其他面</div>
-          <div class="choice">${others.map((c) => `<button class="btn ghost" data-move="${esc(c.id)}">${esc(c.name)}</button>`).join('')}</div>
-          ${p.inMatch ? '<p class="muted">他還有這一面未開始的場次，不能換面；請先清除該面輪轉表，或用「離場並重排」。</p>' : ''}` : ''}
+          ${p.inMatch
+            ? '<p class="muted">他已排進這一面的輪轉表，不能換面。還沒有比分時先到「輪轉」清除；已有比分時請用下方「離場並重排」，再換面並取消離場。</p>'
+            : `<div class="choice">${others.map((c) => `<button class="btn ghost" data-move="${esc(c.id)}">${esc(c.name)}</button>`).join('')}</div>`}` : ''}
         <div class="group-title">中途離場</div>
         ${p.left
           ? '<button class="btn ghost block" id="mUndoLeave">取消離場</button>'
