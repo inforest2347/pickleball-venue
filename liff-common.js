@@ -5,8 +5,21 @@
 (function () {
   'use strict';
 
+  /** v2.3：SDK 改為非同步載入，用到時才等它 */
+  function sdkReady() {
+    if (window.liff) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      const el = document.getElementById('liffSdk');
+      if (!el) return reject(new Error('找不到 LIFF SDK'));
+      el.addEventListener('load', function () { resolve(); });
+      el.addEventListener('error', function () { reject(Object.assign(new Error('LINE 元件載入失敗，請檢查網路後重新開啟'), { code: 'NETWORK' })); });
+      if (window.liff) resolve();
+    });
+  }
+
   async function init(liffId) {
     if (!liffId) throw new Error('尚未設定 LIFF_ID');
+    await sdkReady();
     await liff.init({ liffId: liffId });
     if (!liff.isLoggedIn()) {
       liff.login({ redirectUri: location.href });

@@ -214,3 +214,9 @@ label.inline select { display: block; width: 100%; margin-top: 4px; padding: 10p
 /* ---------- v2.2：先顯示上次的資料 ---------- */
 .stalebar { margin-top: 10px; padding: 6px 10px; border-radius: 8px; background: #eef1ef; color: var(--muted); font-size: 13px; text-align: center; }
 body.stale #app .btn, body.stale #app [data-act] { opacity: .55; pointer-events: none; }
+
+/* ---------- v2.3：載入中的骨架畫面 ---------- */
+.skeleton { padding-top: 4px; }
+.sk-card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 14px; margin-bottom: 10px; }
+.sk-card i { display: block; height: 12px; border-radius: 6px; margin: 8px 0; background: linear-gradient(90deg, #eceeed 25%, #f6f7f6 50%, #eceeed 75%); background-size: 200% 100%; animation: sk 1.2s infinite linear; }
+@keyframes sk { from { background-position: 200% 0; } to { background-position: -200% 0; } }

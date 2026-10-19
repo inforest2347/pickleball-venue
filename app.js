@@ -1,5 +1,6 @@
 /**
- * venue/app.js — 場主 LIFF 頁面　v2.2（2026/10/15：讀取優化；含 v2.1 我已到場定位）
+ * venue/app.js — 場主 LIFF 頁面　v2.3（2026/10/19：開頁更快；含 v2.2 讀取優化、v2.1 我已到場定位）
+ * v2.3：LINE 登入（liff.init）完成前就先顯示上次的畫面；切回 LINE 時立刻更新；排班頁預先載入今天的名單
  * v2.2：開頁一次 init、先顯示上次的資料再更新、30 秒輪詢只比對簽章、比分與簽到先更新畫面
  * 頁面：shifts 我的排班／checkin 今日球敘（點名・輪轉・比分・積分）／report 收班回報／profile 我的資料
  * 網址：https://liff.line.me/{LIFF_ID}?page=checkin（可加 &shift=排班ID&tab=score）
@@ -37,7 +38,6 @@
 
   async function boot() {
     try {
-      await LiffKit.init(CFG.LIFF_ID);
       const p = LiffKit.params();
       state.page = PAGES.indexOf(p.get('page')) >= 0 ? p.get('page') : 'shifts';
       state.shiftId = p.get('shift') || '';
@@ -59,6 +59,7 @@
         if (canShow) route();
       }
 
+      await LiffKit.init(CFG.LIFF_ID); // v2.3：上次的畫面已先顯示，這裡才等 LINE 登入
       const init = await api('init', { page: state.page, shiftId: state.shiftId });
       state.me = init.me;
       state.shifts = init.shifts || null;
@@ -71,9 +72,45 @@
       showWho();
       route();
       flushScores();
+      document.addEventListener('visibilitychange', onVisible);
     } catch (e) {
-      showFatal(e);
+      if (state.stale) {
+        // 已經顯示上次的畫面：不要整頁換成錯誤，提示即可
+        toast(e.message || '無法更新，請稍後再試', 'error');
+        const bar = document.querySelector('.stalebar');
+        if (bar) bar.textContent = '目前顯示上次的資料（無法更新：' + (e.message || '連線問題') + '）';
+      } else {
+        showFatal(e);
+      }
     }
+  }
+
+  /** v2.3：從背景切回 LINE 時立刻檢查一次，不必等 30 秒 */
+  let lastVisibleCheck = 0;
+  function onVisible() {
+    if (document.visibilityState !== 'visible' || state.stale) return;
+    if (Date.now() - lastVisibleCheck < 10000) return;
+    lastVisibleCheck = Date.now();
+    if (state.page === 'checkin' && state.roster) pollRoster(true);
+  }
+
+  /** v2.3：在排班頁時，背景先載入「今天唯一一場」的名單，點進今日球敘就不用等 */
+  async function prefetchToday() {
+    if (state.stale || !state.shifts) return;
+    const today = state.shifts.filter((s) => s.isToday && s.editable && s.sessionStatus !== '取消');
+    if (today.length !== 1) return;
+    const id = today[0].shiftId;
+    if (state.roster && state.roster.shift.shiftId === id) return;
+    try {
+      state.prefetch = { id: id, p: api('roster', { shiftId: id }) };
+      const r = await state.prefetch.p;
+      state.prefetch = null;
+      if (!state.roster || state.page !== 'checkin') {
+        state.roster = r;
+        if (!state.shiftId) state.shiftId = id;
+        saveSnap();
+      }
+    } catch (e) { state.prefetch = null; /* 背景載入失敗不影響 */ }
   }
 
   function showWho() {
@@ -145,7 +182,10 @@
   }
 
   function loading(text) {
-    app.innerHTML = '<div class="loading">' + esc(text || '載入中…') + '</div>';
+    app.innerHTML = '<div class="skeleton" aria-label="' + esc(text || '載入中') + '">' +
+      '<div class="sk-card"><i style="width:60%"></i><i style="width:85%"></i><i style="width:40%"></i></div>' +
+      '<div class="sk-card"><i style="width:70%"></i><i style="width:50%"></i></div>' +
+      '<div class="sk-card"><i style="width:65%"></i><i style="width:45%"></i></div></div>';
   }
 
   /** 執行寫入動作：防止連點，錯誤統一提示 */
@@ -219,7 +259,9 @@
       if (state.page !== 'shifts') return null;
     }
     state.shiftsStale = true; // 下次切回排班頁時重新整理
-    return drawShifts(list);
+    const out = drawShifts(list);
+    setTimeout(prefetchToday, 300);
+    return out;
   }
 
   function drawShifts(list) {
@@ -280,7 +322,9 @@
       if (!shiftId) return;
       if (!state.roster || state.roster.shift.shiftId !== shiftId) {
         loading();
-        state.roster = await api('roster', { shiftId: shiftId });
+        // 排班頁正在預先載入同一場時，等它就好，不重複呼叫
+        state.roster = state.prefetch && state.prefetch.id === shiftId
+          ? await state.prefetch.p : await api('roster', { shiftId: shiftId });
         saveSnap();
       }
     } catch (e) {
@@ -866,10 +910,10 @@
   }
 
   /** 30 秒輪詢：先比對簽章（只讀報名與對戰），有變動或每 5 次才抓完整名單 */
-  async function pollRoster() {
+  async function pollRoster(now) {
     if (state.busy || !modal.hidden || !state.shiftId || !state.roster) return;
     state.pollCount += 1;
-    if (state.pollCount % FULL_EVERY === 0) return refreshRoster();
+    if (!now && state.pollCount % FULL_EVERY === 0) return refreshRoster();
     try {
       const r = await api('poll', { shiftId: state.shiftId, sig: state.roster.sig });
       if (r.changed) refreshRoster();

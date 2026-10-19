@@ -4,7 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>理論上場主</title>
-  <link rel="stylesheet" href="style.css?v=2.2">
+  <!-- v2.3：先和會用到的主機建立連線，省掉第一次請求的握手時間 -->
+  <link rel="preconnect" href="https://script.google.com">
+  <link rel="preconnect" href="https://script.googleusercontent.com">
+  <link rel="preconnect" href="https://static.line-scdn.net">
+  <link rel="preconnect" href="https://api.line.me">
+  <link rel="stylesheet" href="style.css?v=2.3">
 </head>
 <body>
   <header class="topbar">
@@ -13,7 +18,11 @@
   </header>
 
   <main id="app">
-    <div class="loading">載入中…</div>
+    <div class="skeleton" aria-label="載入中">
+      <div class="sk-card"><i style="width:60%"></i><i style="width:85%"></i><i style="width:40%"></i></div>
+      <div class="sk-card"><i style="width:70%"></i><i style="width:50%"></i></div>
+      <div class="sk-card"><i style="width:65%"></i><i style="width:45%"></i></div>
+    </div>
   </main>
 
   <nav id="tabs" class="tabs" hidden>
@@ -25,9 +34,10 @@
 
   <div id="modal" class="modal" hidden></div>
 
-  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
-  <script src="liff-common.js?v=2"></script>
+  <!-- v2.3：LIFF SDK 非同步載入，上次的畫面不必等它 -->
+  <script id="liffSdk" async src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <script src="liff-common.js?v=2.3"></script>
   <script src="config.js"></script>
-  <script src="app.js?v=2.2"></script>
+  <script src="app.js?v=2.3"></script>
 </body>
 </html>
