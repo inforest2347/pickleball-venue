@@ -1,5 +1,6 @@
 /**
- * venue/app.js — 場主 LIFF 頁面　v2.3（2026/10/19：開頁更快；含 v2.2 讀取優化、v2.1 我已到場定位）
+ * venue/app.js — 場主 LIFF 頁面　v2.4（2026/10/20：比分在逾時／系統忙碌時保留重送）
+ * v2.3（2026/10/19：開頁更快；含 v2.2 讀取優化、v2.1 我已到場定位）
  * v2.3：LINE 登入（liff.init）完成前就先顯示上次的畫面；切回 LINE 時立刻更新；排班頁預先載入今天的名單
  * v2.2：開頁一次 init、先顯示上次的資料再更新、30 秒輪詢只比對簽章、比分與簽到先更新畫面
  * 頁面：shifts 我的排班／checkin 今日球敘（點名・輪轉・比分・積分）／report 收班回報／profile 我的資料
@@ -660,7 +661,8 @@
           changed = true;
           if (item.shiftId === state.shiftId) applyResult(res);
         } catch (e) {
-          if (e.code === 'NETWORK' || e.code === 'BAD_RESPONSE') break; // 還是斷線，下次再送
+          // v2.4：逾時、系統忙碌也保留在佇列下次再送（比分寫入可重送，不會重複）；v2.3 遇到忙碌會丟掉這筆比分
+          if (['NETWORK', 'BAD_RESPONSE', 'TIMEOUT', 'BUSY', 'SERVER_ERROR'].indexOf(e.code) >= 0) break;
           removeQueued(id);
           changed = true;
           toast('比分沒有存成功：' + e.message, 'error');

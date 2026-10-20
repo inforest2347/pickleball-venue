@@ -43,14 +43,21 @@
   async function call(gasUrl, action, data) {
     const idToken = liff.getIDToken();
     let res;
+    // v2.4：25 秒逾時（原本沒有上限，網路卡住時畫面會一直轉圈）
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 25000) : null;
     try {
       res = await fetch(gasUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ action: action, idToken: idToken, data: data || {} }),
+        signal: ctrl ? ctrl.signal : undefined,
       });
     } catch (e) {
+      if (e && e.name === 'AbortError') throw Object.assign(new Error('連線逾時，請確認網路後再試一次'), { code: 'TIMEOUT' });
       throw Object.assign(new Error('網路連線失敗，請稍後再試'), { code: 'NETWORK' });
+    } finally {
+      if (timer) clearTimeout(timer);
     }
     let json;
     try {
