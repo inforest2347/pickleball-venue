@@ -1,5 +1,5 @@
 /**
- * venue/app.js — 場主 LIFF 頁面　v2.4（2026/10/20：比分在逾時／系統忙碌時保留重送）
+ * venue/app.js — 場主 LIFF 頁面　v2.5（2026/10/21：顯示付款人、同一付款人一起收款）；v2.4（比分在逾時／系統忙碌時保留重送）
  * v2.3（2026/10/19：開頁更快；含 v2.2 讀取優化、v2.1 我已到場定位）
  * v2.3：LINE 登入（liff.init）完成前就先顯示上次的畫面；切回 LINE 時立刻更新；排班頁預先載入今天的名單
  * v2.2：開頁一次 init、先顯示上次的資料再更新、30 秒輪詢只比對簽章、比分與簽到先更新畫面
@@ -456,6 +456,7 @@
       p.isFree ? '<span class="tag">免費體驗</span>' : '',
       p.source === '現場' && !pending ? '<span class="tag">現場</span>' : '',
       p.dupr ? `<span class="tag">DUPR ${esc(p.dupr)}</span>` : '',
+      p.payer ? `<span class="tag green">付款人 ${esc(p.payer)}</span>` : '', // v2.5
     ].join('');
     let pay = '';
     if (p.hasAr) {
@@ -863,11 +864,23 @@
 
   function openCollect(p) {
     const methods = state.roster.payMethods;
+    // v2.5：同一付款人（家長＋孩子）還有未收的 → 可勾選一起收，一次送出
+    const mates = (state.roster.people || []).filter((x) =>
+      x.regId !== p.regId && p.payerKey && x.payerKey === p.payerKey && x.hasAr && x.unpaid > 0 && x.status !== '現場待確認');
+    const mateHtml = mates.length ? `
+        <div class="card" style="margin:8px 0;padding:8px 10px">
+          <div class="muted">同一付款人${p.payer ? '（' + esc(p.payer) + '）' : ''}還有未收，可一起收清：</div>
+          ${mates.map((x) => `<label style="display:flex;gap:8px;align-items:center;margin:4px 0">
+            <input type="checkbox" class="cMate" value="${esc(x.regId)}" data-amt="${x.unpaid}" checked style="width:auto">
+            <span>${esc(x.name)}　${money(x.unpaid)}</span></label>`).join('')}
+        </div>` : '';
     modal.innerHTML = `
       <div class="sheet">
         <h2>收款：${esc(p.name)}</h2>
-        <p class="muted">應收 ${money(p.due)}　已收 ${money(p.paid)}　未收 <b>${money(p.unpaid)}</b></p>
+        <p class="muted">應收 ${money(p.due)}　已收 ${money(p.paid)}　未收 <b>${money(p.unpaid)}</b>${p.payer ? '　付款人 ' + esc(p.payer) : ''}</p>
+        ${mateHtml}
         <label>金額<input id="cAmount" type="number" inputmode="numeric" min="1" value="${p.unpaid}"></label>
+        <p class="muted" id="cMateHint" hidden>一起收時每人收未收全額，合計 <b id="cMateSum"></b></p>
         <label>付款方式
           <select id="cMethod">${methods.map((m) => `<option>${esc(m)}</option>`).join('')}</select>
         </label>
@@ -884,9 +897,23 @@
     method.addEventListener('change', () => {
       document.getElementById('cLast5Wrap').hidden = method.value !== '轉帳';
     });
+    const amountEl = document.getElementById('cAmount');
+    const checkedMates = () => [...modal.querySelectorAll('.cMate:checked')];
+    const syncMates = () => {
+      const picked = checkedMates();
+      const together = picked.length > 0;
+      amountEl.disabled = together;
+      if (together) amountEl.value = p.unpaid;
+      document.getElementById('cMateHint').hidden = !together;
+      document.getElementById('cMateSum').textContent =
+        money(p.unpaid + picked.reduce((s, el) => s + Number(el.dataset.amt || 0), 0));
+    };
+    modal.querySelectorAll('.cMate').forEach((el) => el.addEventListener('change', syncMates));
+    syncMates();
     document.getElementById('cCancel').addEventListener('click', closeModal);
     document.getElementById('cOk').addEventListener('click', () => rosterAct('collect', {
       regId: p.regId,
+      regIds: checkedMates().length ? [p.regId].concat(checkedMates().map((el) => el.value)) : undefined,
       amount: document.getElementById('cAmount').value,
       method: method.value,
       last5: document.getElementById('cLast5').value,
